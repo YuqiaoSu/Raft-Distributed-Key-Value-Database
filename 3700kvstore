@@ -1,0 +1,534 @@
+#!/usr/bin/env python3
+
+import argparse, socket, time, json, select, struct, sys, math, os
+import random
+import signal
+
+BROADCAST = "FFFF"
+
+
+class Replica:
+    def __init__(self, port, id, others):
+        self.debugtime = time.time()
+        self.port = port
+        self.id = id
+        self.others = others
+        # state of current replica
+        self.state = "Follower"
+
+        # the log entry used to store key value pair
+        self.log = []
+        # the leader ID that current replica believe.
+        self.leaderID = BROADCAST
+        # election time out, the paper suggest 150 to 300 ms, the default wait time for test == 2 seconds
+        # so there should be a leader when user begin to send request.
+        self.election_timeout = random.randrange(150, 300) * 0.01
+        self.last_RPC = time.time()
+        # for handling the partition.
+        self.election_count = len(others) + 1
+        self.received_vote_count = 0
+        self.count_voted_replica = 0
+        self.last_count_time = time.time()
+        self.count_timeout = 1
+        # heart beat and time out
+        self.heartbeat_timeout = 0.25
+        self.last_heartbeat = time.time()
+
+        # latest term server has seen
+        self.currentTerm = 0
+        # candidateId that received vote in current term
+        self.votedFor = None
+        # index of highest log entry known to be committed ||| Don't need th== because we don't actually commiting data?
+        self.commitIndex = 0
+        # index of the highest log entry applied to state machine
+        self.lastApplied = 0
+        # for each server, index of the next log entry to send to that server
+        # Th== == used for incons==tency recovery of logs, can just send all logs and let replica decide where to copy.
+        self.nextIndex = []
+        # for each server, index of the highest log entry known to be replicated on server
+        self.matchIndex = []
+
+        # Above are arguments stated in the paper
+
+        # how many replicas are there, maybe future test will add new replicas, remember to modify if there ==.
+        self.total_replica_num = len(others) + 1
+        # received votes must be more than half of total replica numbers
+        self.received_votes = 0
+        # received append message for append entry RPC
+        self.pending_request = []
+        # this must be high enough for waiting the response and avoid uneccessary decrease
+        self.pending_timeout = self.election_timeout
+        self.last_pending = time.time()
+
+        self.follower_pending_request = []
+
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.socket.bind(('localhost', 0))
+
+        # print("Replica %s starting up" % self.id, True)
+        hello = {"src": self.id, "dst": BROADCAST, "leader": BROADCAST, "type": "hello"}
+        # print(time.time() - self.debugtime, flush=True)
+        # print(time.time(), flush=True)
+        self.send(hello)
+        # print("Sent hello message: %s" % hello, True)
+
+    def send(self, message):
+        self.socket.sendto(json.dumps(message).encode('utf-8'), ('localhost', self.port))
+        # print("Sent message by", flush=True)
+        # print(self.id, flush=True)
+        # print(message, flush=True)
+
+    def run(self):
+        while True:
+            self.socket.setblocking(0)
+            ready = select.select([self.socket], [], [], 0.01)
+
+            if ready[0]:
+                # print(time.time() - self.debugtime, flush=True)
+                # print(time.time(), flush=True)
+
+                data = self.socket.recv(65535)
+                msg = json.loads(data.decode('utf-8'))
+                # print("Recevied message by", flush=True)
+                # print(self.id, flush=True)
+                # print(msg, flush=True)
+                if self.state == "Follower":
+                    if msg['type'] == "appendEntry":
+                        self.follower_append_entry(msg)
+                    if msg['type'] == "requestVote":
+                        self.follower_request_vote(msg)
+                    if time.time() - self.last_RPC > self.election_timeout:
+                        # print("``````````````````````````````````````", flush=True)
+                        # print(time.time(), flush=True)
+                        # print(self.last_RPC, flush=True)
+                        # print(self.election_timeout, flush=True)
+                        self.received_vote_count = 0
+                        self.count_voted_replica = 0
+                        self.last_count_time = time.time()
+                        self.state = "Candidate"
+                        self.candidate_request_vote()
+
+                if self.state == "Candidate":
+
+                    if (msg['type'] == "requestVote" or msg['type'] == "appendEntry") and (msg[
+                        'term'] >= self.currentTerm or msg["lastLogIndex"] > len(self.log)):
+                        self.state = "Follower"
+                        self.received_votes = 0
+                        self.currentTerm = msg['term']
+                        self.reset_timeout()
+                        continue
+
+                    if msg['type'] == "requestVote":
+                        self.count_voted_replica += 1  
+                        self.last_count_time = time.time()
+                    # update the number of total replica number
+                    if time.time() - self.last_count_time > self.count_timeout:
+                        # print("``````````````````````````````````````", flush=True)
+                        # print(self.count_voted_replica,flush=True)
+                        self.election_count = self.count_voted_replica
+                        if self.election_count < math.ceil(self.total_replica_num / 2.0):
+                            self.state = "Follower"
+                            self.received_votes = 0
+                            self.stop_election_timeout()
+                            continue
+                        
+
+                    if msg['type'] == "requestVote" and msg['vote']:    
+                        self.received_votes += 1
+                        self.last_RPC = time.time()
+
+                    if self.received_votes >= math.ceil((self.election_count / 2.0)):
+                        # print("received_votes", flush=True)
+                        # print(self.received_votes, flush=True)
+                        # print(self.total_replica_num, flush=True)
+                        self.state = "Leader"
+                        # print(self.id, flush=True)
+                        # print("new leader is elected", flush=True)
+                        self.received_votes = 0
+                        self.leaderID = self.id
+                        self.empty_append_entries()
+
+                    if time.time() - self.last_RPC > self.election_timeout:
+                        self.state = "Candidate"
+                        self.count_voted_replica = 0
+                        self.received_votes = 0
+                        self.last_count_time = time.time()
+                        self.candidate_request_vote()
+                # This replica is the Leader
+                if self.state == "Leader":
+                    self.pending_append_entry()
+                    if time.time() - self.last_heartbeat > self.heartbeat_timeout:
+                        self.empty_append_entries()
+                    if msg['type'] == "redirect":
+                        user = msg['user']
+                        operation = msg['operation']
+                        if operation == "get":
+                            self.client_get(msg, user)
+                        if operation == "put":
+                            self.client_put(msg, user)
+                    if msg['type'] == "appendEntry":
+                        self.leader_reply_client(msg)
+
+                if msg['type'] == "put":
+                    self.client_put(msg, None)
+                if msg['type'] == "get":
+                    self.client_get(msg, None)
+                # print("Received message '%s'" % (msg,), True)
+            else:
+                # print("==================================", flush=True)
+                # print(time.time() - self.debugtime, flush=True)
+                # print(time.time(), flush=True)
+                if self.state == "Follower":
+                    if time.time() - self.last_RPC > self.election_timeout:
+                        self.state = "Candidate"
+                        self.candidate_request_vote()
+                if self.state == "Leader":
+                    if time.time() - self.last_heartbeat > self.heartbeat_timeout:
+                        self.empty_append_entries()
+
+    def leader_reply_client(self, message):
+        # leader finds out that it == outdated and return back to follower.
+        # print("kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk", flush=True)
+        if "lastLogIndex" in message:
+            if len(self.log) + len(self.pending_request) < message['lastLogIndex']:
+                self.state = "Follower"
+                self.currentTerm = message['term']
+                self.leaderID = message['leader']
+                self.redirect_pending_message()
+                return
+
+        if self.currentTerm < message['term']:
+            self.state = "Follower"
+            self.currentTerm = message['term']
+            self.leaderID = message['leader']
+            self.redirect_pending_message()
+            return
+        # print("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz", flush=True)
+        reply = {"src": self.id, "type": "ok", "leader": self.id}
+
+        # append entry has no possibility of get
+        # if message['operation'] == "get":
+        #     self.client_get(message,message['user'])
+        #     return
+
+        if 'MID' not in message:
+            return
+        # print(self.pending_request, flush=True)
+        for x in range(len(self.pending_request)):
+            record = self.pending_request[x]
+            # print("**************************************", flush=True)
+            # print(entry, flush=True)
+            # print(message, flush=True)
+            # print("**************************************", flush=True)
+            if record['MID'] == message['MID']:
+                record['success_count'] += 1
+                record['replied'].append(message['src'])
+                # A majority of replicas acknowledged the entry
+                if not record['okAnswer'] and record['success_count'] >= math.ceil((self.total_replica_num / 2.0)):
+
+                    flag = True
+                    for y in range(len(self.log)):
+                        if self.log[y]['key'] == record['entry']['key']:
+                            flag = False
+                            self.log[y] = record['entry']
+                            break
+                    if flag:
+                        self.log.append(record['entry'])
+                    # print("llllllllllllllllllllllllllllllllllll", flush=True)
+                    reply['dst'] = record['user']
+                    reply['MID'] = record['MID']
+                    record['okAnswer'] = True
+                    self.send(reply)
+                return
+    # leader becomes a follower
+    def redirect_pending_message(self):
+        message = {"src": self.id, "dst": self.leaderID,"type" : "redirect","lastLogIndex": len(self.log),
+                 "leader": self.leaderID, 'term': self.currentTerm}
+        for record in self.pending_request:
+            message['MID'] = record['MID']
+            message['user'] = record['user']
+            message['operation'] = record['operation']
+            message['key'] = record['key']
+            message['value'] = record['value']
+            self.send(message)
+        self.pending_request = []
+
+    # increment current term, vote for itself, and broadcast to all replicas
+    def candidate_request_vote(self):
+        self.currentTerm += 1
+        self.leaderID = BROADCAST
+        message = {"src": self.id, "dst": BROADCAST,
+                   "candidateID": self.id, "term": self.currentTerm, "lastLogIndex": len(self.log), "lastLogTerm": None,
+                   "type": "requestVote", "leader": self.leaderID, 'vote': False}
+        self.send(message)
+        self.received_votes += 1
+        self.reset_timeout()
+
+    # follower received request vote RPC from candidate
+    # check for term number, latest log number, and reset its timeout
+    # candidate’s log == at least as up-to-date as receiver’s log
+    def follower_request_vote(self, message):
+        reply = {"src": self.id, "dst": message['src'], "type": "requestVote", "leader": self.leaderID, "vote": False,
+                 "term": self.currentTerm,"lastLogIndex": len(self.log)}
+        if self.votedFor == message['src']:
+            return
+        if self.votedFor != None or self.currentTerm > message["term"] or len(self.log) > message['lastLogIndex']:
+            # reject vote
+            self.send(reply)
+            return
+        else:
+            reply['vote'] = True
+            self.votedFor = message['src']
+            self.leaderID = BROADCAST
+            self.last_RPC = time.time()
+            self.send(reply)
+
+    # follower will reply true if the term >= current term,
+    # delete conflict entry(same index, different term) and all follows it
+    # append new index.
+    # TO DO: actually  define log append
+    def follower_append_entry(self, message):
+        leader_term = message['term']
+        # prevLogIndex = message['prevLogIndex']
+        # prevLogTerm = message['prevLogTerm']
+
+        reply = {"src": self.id, "dst": self.leaderID, "type": "appendEntry","lastLogIndex": len(self.log),
+                 "leader": self.leaderID, "success": False, 'term': self.currentTerm}
+
+        # The partition will cause reply directed to none leader
+        if 'key' not in message:
+            return
+        # th== leader == invalid, ask it to update term number.
+        if leader_term < self.currentTerm:
+            self.send(reply)
+            return
+
+        # heart beat
+        if message['key'] == None or message['value'] == None:
+            self.reset_timeout()
+            self.leaderID = message['leader']
+            self.votedFor = None
+            # self.log = msg['entries']
+            self.currentTerm = message['term']
+            self.total_replica_num = message['replies']
+            self.follower_reply_fail()
+            self.follower_pending_request = []
+            return
+
+        entry = {'key': message['key'], 'value': message['value'], 'term': self.currentTerm}
+        for x in range(len(self.follower_pending_request) - 1, -1 ,-1):
+            if self.follower_pending_request[x]['MID'] == message['MID']:
+                self.follower_pending_request.pop(x)
+        flag = True
+        for x in range(len(self.log)):
+            if self.log[x]['key'] == entry['key']:
+                flag = False
+                self.log[x] = entry
+                break
+        if flag:
+            self.log.append(entry)
+        self.currentTerm = message['term']
+        # in case some replica is killed
+        self.total_replica_num = message['replies']
+        reply["success"] = True
+        reply['MID'] = message['MID']
+        self.reset_timeout()
+        self.send(reply)
+
+    def pending_append_entry(self):
+        message = {"src": self.id, "dst": BROADCAST, "type": "appendEntry", "term": self.currentTerm,
+                   "leader": self.leaderID, "leaderCommit": self.commitIndex, "key": None, "value": None,"lastLogIndex": len(self.log)}
+
+        # print(self.pending_request, flush=True)
+        # check for unresponded append entry.
+        # if the replies are all collected, then successfully stored
+        # if unexpected replicas are brought up, record its existence
+        # if not enough replicas responded in a given time, record it as failed.
+        for i in range(len(self.pending_request) - 1, -1, -1):
+            record = self.pending_request[i]
+            if time.time() - record['time'] > self.pending_timeout:
+                record['time'] = time.time()
+                if len(record['replied']) == self.total_replica_num - 1:
+                    self.pending_request.pop(i)
+                elif len(record['replied']) > self.total_replica_num - 1:
+                    self.total_replica_num = len(record['replied'])
+                    self.others = record['replied']
+                    self.pending_request.pop(i)
+                elif len(record['replied']) < self.total_replica_num - 1:
+                    if record['retry_time'] >= 3:
+                        if not record['okAnswer']:
+                            reply = {"src": self.id, 'dst': record['user'],
+                                     "type": "ok", "leader": self.id, 'MID': record['MID']}
+                            self.send(reply)
+                        # print("==================================", flush=True)
+                        # print(self.total_replica_num, flush=True)
+                        self.pending_request.pop(i)
+                        self.total_replica_num -= 1
+                        self.others = record['replied']
+                        continue
+                    for other in self.others:
+                        if other not in record['replied']:
+                            # print(message, flush=True)
+                            # print("**************************************", flush=True)
+                            record['retry_time'] += 1
+                            message['dst'] = other
+                            message['MID'] = record['MID']
+                            message['key'] = record['entry']['key']
+                            message['value'] = record['entry']['value']
+                            message['replies'] = self.total_replica_num
+                            self.send(message)
+                            continue
+
+    def follower_reply_fail(self):
+        if self.leaderID != BROADCAST and self.state != "Candidate":
+            for replicate in self.follower_pending_request:
+                replicate['dst'] = self.leaderID
+                replicate['leader'] = self.leaderID
+                print("Recover from patition and send saved logs", flush=True)
+                self.send(replicate)
+            self.follower_pending_request = []
+
+        if self.state == "Leader":
+            for replicate in self.follower_pending_request:
+                if replicate['operation'] == "get":
+                    self.client_get(replicate,replicate['user'])
+                if replicate['operation'] == "put":
+                    self.client_put(replicate,replicate['user'])
+
+    # Th== == the heart beat used by Leader.
+    def empty_append_entries(self):
+        message = {"src": self.id, "dst": BROADCAST, "type": "appendEntry", "term": self.currentTerm,
+                   "leader": self.leaderID, "leaderCommit": self.commitIndex, "key": None, "value": None,"lastLogIndex": len(self.log)}
+        self.last_heartbeat = time.time()
+        message['replies'] = self.total_replica_num
+        self.send(message)
+
+    def reset_timeout(self):
+        self.election_timeout = random.randrange(150, 300) * 0.01
+        self.last_heartbeat = time.time()
+        self.last_RPC = time.time()
+    
+    def stop_election_timeout(self):
+        self.election_timeout = 200
+        self.last_heartbeat = time.time()
+        self.last_RPC = time.time()
+
+    def client_put(self, message, user):
+        reply = {"src": self.id, "dst": message['src'], "leader": self.leaderID, "type": "fail",
+                 'term': self.currentTerm,
+                 "MID": message['MID']}
+
+        # candidate will not process put or get
+        # if self.state == "Candidate" or self.leaderID == BROADCAST:
+        #     self.send(reply)
+        #     return
+        reply['operation'] = "put"
+        reply['key'] = message['key']
+        reply['value'] = message['value']
+        reply['lastLogIndex'] = len(self.log)
+        # follower will redirect put or get
+        # if self.state == "Follower":
+        #     reply['type'] = "redirect"
+        #     reply['dst'] = self.leaderID
+        #     reply['user'] = message['src']
+        #     reply['operation'] = message['type']
+        #     self.send(reply)
+        #     self.follower_pending_request.append(reply)
+        #     return
+
+        # leader will first append new log with current term into its own log entries
+        # ask others to replicate th== log entry by sending append entry RPC
+        # retry indefinitely until all other replicas reply ok.
+        if self.state == "Leader":
+            # reply['preLogIndex'] = len(self.log)
+            # reply['preLogTerm'] = self.log[len(self.log) - 1]['term']
+            entry = {'key': message['key'], 'value': message['value'], 'term': self.currentTerm}
+            reply['dst'] = BROADCAST
+            reply['type'] = "appendEntry"
+            reply['lastLogIndex'] =  len(self.log)
+            # how many replica is still alive.
+            reply['replies'] = self.total_replica_num
+            self.send(reply)
+            self.last_heartbeat = time.time()
+            record = {"MID": message['MID'], 'success_count': 0, "replied": [],
+                      "entry": entry, "retry_time": 0,"operation": "put", "okAnswer": False}
+            record['key'] = message['key']
+            record['value'] = message['value']
+            if user != None:
+                record['user'] = user
+            else:
+                record['user'] = message['src']
+            record['time'] = time.time()
+            self.pending_request.append(record)
+        else:
+            
+            reply['type'] = "redirect"
+            reply['dst'] = self.leaderID
+            reply['user'] = message['src']
+            reply['operation'] = message['type']
+            self.send(reply)
+            self.follower_pending_request.append(reply)
+            return
+
+    # the user input == used for redirected message from replicas to leader.
+    def client_get(self, message, user):
+
+        reply = {"src": self.id, "dst": message['src'],
+                 "leader": self.leaderID, "type": "fail",
+                 "MID": message['MID']}
+
+        # # candidate will not process put or get
+        # if self.state == "Candidate" or self.leaderID == BROADCAST:
+        #     self.send(reply)
+        #     return
+
+        reply['lastLogIndex'] = len(self.log)
+        # # follower will redirect put or get
+        # if self.state == "Follower":
+        #     reply['key'] = message['key']
+        #     reply['type'] = "redirect"
+        #     reply['dst'] = self.leaderID
+        #     reply['user'] = message['src']
+        #     reply['operation'] = message['type']
+        #     reply['term'] = self.currentTerm
+            
+        #     self.send(reply)
+        #     self.follower_pending_request.append(reply)
+        #     return
+
+        if self.state == "Leader":
+            # print("//////////////////////////////////////////////////////////////////////////")
+            # print(self.log, flush=True)
+            for entry in self.log:
+                if entry['key'] == message['key']:
+                    value = entry['value']
+                    reply['type'] = "ok"
+                    reply['value'] = value
+                    if user != None:
+                        reply['dst'] = user
+                    else:
+                        reply['dst'] = message['src']
+
+                    self.send(reply)
+                    return
+        else:
+            reply['key'] = message['key']
+            reply['type'] = "redirect"
+            reply['dst'] = self.leaderID
+            reply['user'] = message['src']
+            reply['operation'] = message['type']
+            reply['term'] = self.currentTerm
+            
+            self.send(reply)
+            self.follower_pending_request.append(reply)
+            return
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='run a key-value store')
+    parser.add_argument('port', type=int, help="Port number to communicate")
+    parser.add_argument('id', type=str, help="ID of th== replica")
+    parser.add_argument('others', metavar='others', type=str, nargs='+', help="IDs of other replicas")
+    args = parser.parse_args()
+    replica = Replica(args.port, args.id, args.others)
+    replica.run()
